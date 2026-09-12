@@ -12,9 +12,6 @@ from core.schema import LegalDiff, CitizenAction
 
 load_dotenv(find_dotenv())
 
-# -------------------------------------------------------------------
-# 1. State Definition
-# -------------------------------------------------------------------
 class AgentState(TypedDict, total=False):
     docket_id: str
     title: str
@@ -23,14 +20,10 @@ class AgentState(TypedDict, total=False):
     legal_diff: LegalDiff
     citizen_action: CitizenAction
 
-# -------------------------------------------------------------------
-# 2. LLM Initializer
-# -------------------------------------------------------------------
 def get_llm():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise ValueError("GROQ_API_KEY not found in environment!")
-    # groq/compound is native, fast, and does not crash on prompt validation
     return ChatGroq(
         model="groq/compound",
         temperature=0.2,
@@ -38,9 +31,6 @@ def get_llm():
         api_key=api_key
     )
 
-# -------------------------------------------------------------------
-# 3. Node 1: Legal Diff Extraction & Simplification
-# -------------------------------------------------------------------
 def legal_diff_node(state: AgentState) -> dict:
     llm = get_llm()
     baseline = state.get("baseline", "None cited")
@@ -83,19 +73,19 @@ Provide your response strictly using these labeled tags:
     section_code = extract_tag("SECTION_CODE", resp, "§ Municipal Code")
     baseline_rule = extract_tag("BASELINE_RULE", resp, baseline[:200])
     proposed_rule = extract_tag("PROPOSED_RULE", resp, "Proposed amendment")
-    plain_summary = extract_tag("PLAIN_SUMMARY", resp, resp[:400])
+    
+    plain_summary = extract_tag("PLAIN_SUMMARY", resp)
+    if not plain_summary:
+        plain_summary = re.sub(r"\[/?.*?\]", "", resp).strip()[:350]
 
     diff = LegalDiff(
-        section_code=section_code,
-        baseline_rule=baseline_rule,
-        proposed_rule=proposed_rule,
+        section_code=re.sub(r"\[/?.*?\]", "", section_code).strip(),
+        baseline_rule=re.sub(r"\[/?.*?\]", "", baseline_rule).strip(),
+        proposed_rule=re.sub(r"\[/?.*?\]", "", proposed_rule).strip(),
         plain_summary=plain_summary
     )
     return {"legal_diff": diff}
 
-# -------------------------------------------------------------------
-# 4. Node 2: Action Synthesis (Dual-Perspective & Podium Script)
-# -------------------------------------------------------------------
 def action_synthesis_node(state: AgentState) -> dict:
     llm = get_llm()
     diff = state.get("legal_diff")
@@ -134,18 +124,18 @@ Format your output using these exact tags:
         match = re.search(pattern, text, re.DOTALL)
         return match.group(1).strip() if match else default
 
-    sms = extract_tag("SMS_ALERT", resp, f"Update on {docket_id}: Public hearing scheduled. Review changes and submit comment.")
+    sms = extract_tag("SMS_ALERT", resp, f"Notice for {docket_id}: Public hearing scheduled. Review changes and submit comment.")
     comment = extract_tag("PUBLIC_COMMENT", resp, resp)
 
+    clean_comment = re.sub(r"\[/?PUBLIC_COMMENT\]", "", comment).strip()
+    clean_sms = re.sub(r"\[/?SMS_ALERT\]", "", sms).strip()
+
     action = CitizenAction(
-        sms_alert=sms[:160],
-        formal_letter=comment
+        sms_alert=clean_sms[:160],
+        formal_letter=clean_comment
     )
     return {"citizen_action": action}
 
-# -------------------------------------------------------------------
-# 5. Compiled LangGraph Pipeline
-# -------------------------------------------------------------------
 def build_reasoning_graph():
     workflow = StateGraph(AgentState)
     workflow.add_node("legal_diff", legal_diff_node)
