@@ -5,3 +5,8 @@ __pycache__/
 .chroma/
 .DS_Store
 data/chroma/
+
+.venv/
+__pycache__/
+*.pyc
+.env

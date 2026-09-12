@@ -1,467 +1,213 @@
-from __future__ import annotations
-
+import sys
+import os
 from pathlib import Path
-
-import folium
 import streamlit as st
-from fpdf import FPDF
-from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 
-from core.schema import CitizenAction
-from dev3_delivery.spatial import compute_impact_zone
+# 1. Path & Imports
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
+try:
+    from dev3_delivery.spatial import render_impact_map, compute_impact_zone
+except ModuleNotFoundError:
+    from spatial import render_impact_map, compute_impact_zone
+
+from dev2_agents import build_reasoning_graph
+from dev1_pipeline.parser import extract_docket_pdf
+from dev1_pipeline.vectordb import get_baseline_statute
 from mock_data import MOCK_PAYLOAD
 
+# 2. Page Configuration
+st.set_page_config(
+    page_title="Poleazy | Municipal Policy Impact",
+    page_icon="🏛️",
+    layout="wide"
+)
 
-PAGE_TITLE = "Poleazy | Municipal Impact Dashboard"
+# 3. Handle Secrets / Environment (Cloud + Local)
+try:
+    if "GROQ_API_KEY" in st.secrets:
+        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+except Exception:
+    from dotenv import load_dotenv
+    load_dotenv()
 
+# Cache the compiled reasoning graph runner
+@st.cache_resource
+def get_reasoning_runner():
+    return build_reasoning_graph()
 
-@st.cache_data(show_spinner=False)
-def get_default_parcels_path() -> str:
-    return str(Path(__file__).resolve().parents[1] / "data" / "parcels.geojson")
+# 4. Custom Styling
+st.markdown(
+    """
+    <style>
+    button[kind="primary"], .stButton > button {
+        color: #ffffff !important;
+        background-color: #2E7D32 !important;
+        border: none !important;
+        border-radius: 6px !important;
+        padding: 0.5rem 1rem !important;
+        font-weight: 600 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
+# 5. Header
+st.title("🏛️ Poleazy: Municipal Policy Impact Dashboard")
+st.caption("Civic transparency platform: Analyze city council dockets before the vote.")
 
-def _build_letter_text(action: CitizenAction, target_address: str, docket_id: str) -> str:
-    base_text = action.formal_letter if action and action.formal_letter else ""
-    if base_text:
-        return base_text
-
-    return (
-        "To the City Council Clerk\n\n"
-        f"Re: Docket {docket_id} — {target_address}\n\n"
-        "Dear Council Members,\n\n"
-        "I am writing to express concern regarding the proposed development in the vicinity of the above address. "
-        "The project may materially alter the character of the surrounding neighborhood, add congestion, and change the "
-        "daily experience for nearby residents and pedestrians.\n\n"
-        "I urge the Council to study the project carefully, review its neighborhood impacts, and consider the experience of "
-        "affected households before approving the proposal.\n\n"
-        "Thank you for your service and for considering this public comment.\n\n"
-        "Sincerely,\n"
-        "A concerned resident\n"
+# 6. Sidebar Docket Controls
+with st.sidebar:
+    st.header("Docket Controls")
+    
+    # File uploader or preset dockets
+    uploaded_pdf = st.file_uploader("Upload Council Docket (PDF)", type=["pdf"])
+    
+    selected_preset = st.selectbox(
+        "Or Select Preset Docket",
+        [
+            "ORD-2026-042: Austin Title 25 Setback Amendment",
+            "MOCK-001: Commercial Height Variance"
+        ]
     )
+    
+    use_live_llm = st.toggle("Run Live Groq Reasoning Graph", value=True)
+    trigger_analysis = st.button("Run Policy Analysis", type="primary", use_container_width=True)
 
-
-def _build_pdf_letter(action: CitizenAction, target_address: str, docket_id: str) -> bytes:
-    text = _build_letter_text(action, target_address, docket_id)
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, "Poleazy Comment Letter", ln=True)
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "", 11)
-
-    for raw_line in text.splitlines():
-        if not raw_line.strip():
-            pdf.ln(4)
-            continue
-        wrapped = raw_line
-        if len(raw_line) > 90:
-            wrapped = "\n".join(
-                [raw_line[i : i + 90] for i in range(0, len(raw_line), 90)]
-            )
-        pdf.multi_cell(0, 6, wrapped)
-
-    return pdf.output(dest="S")
-
-
-def render_css() -> None:
-    st.markdown(
-        """
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-
-            html, body, [data-testid="stAppViewContainer"] {
-                background: #f5f1eb;
-                color: #2f2724;
-            }
-
-            .block-container {
-                padding-top: 1.2rem;
-                padding-bottom: 2rem;
-                max-width: 1440px;
-            }
-
-            .topbar {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 0.7rem 0 1.2rem 0;
-                margin-bottom: 1.1rem;
-                border-bottom: 1px solid rgba(47, 38, 34, 0.12);
-            }
-
-            .brand {
-                font-family: 'Cormorant Garamond', serif;
-                font-size: 3.1rem;
-                font-weight: 600;
-                letter-spacing: -0.06em;
-                color: #2f2724;
-                margin: 0;
-            }
-
-            .nav {
-                display: flex;
-                gap: 2rem;
-                align-items: center;
-                font-size: 0.72rem;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                color: rgba(47, 38, 34, 0.9);
-            }
-
-            .nav .pill {
-                background: #3a2f2b;
-                color: #f6f1ec;
-                border-radius: 999px;
-                padding: 0.8rem 1.15rem;
-                font-weight: 700;
-            }
-
-            .hero-panel {
-                background: #f7f4ef;
-                min-height: 660px;
-                border: 1px solid rgba(47, 38, 34, 0.08);
-                overflow: hidden;
-            }
-
-            .hero-grid {
-                display: flex;
-                flex-wrap: wrap;
-                min-height: 620px;
-                align-items: stretch;
-            }
-
-            .hero-photo {
-                min-height: 620px;
-                background-size: cover;
-                background-position: center;
-                width: 100%;
-            }
-
-            .hero-copy {
-                background: #c8d8c7;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                min-height: 620px;
-                padding: 2.2rem 2.6rem;
-            }
-
-            .headline {
-                font-family: 'Cormorant Garamond', serif;
-                font-size: clamp(3.1rem, 5vw, 6.1rem);
-                line-height: 0.9;
-                letter-spacing: -0.06em;
-                color: #2d2824;
-                margin: 0;
-                font-weight: 500;
-            }
-
-            .muted-copy {
-                font-family: 'Cormorant Garamond', serif;
-                font-size: 2rem;
-                line-height: 1.18;
-                color: #2d2824;
-                max-width: 440px;
-                margin-top: 1.35rem;
-            }
-
-            .eyebrow {
-                display: inline-block;
-                width: fit-content;
-                margin-bottom: 0.9rem;
-                padding: 0.45rem 0.7rem;
-                border-radius: 999px;
-                background: rgba(48, 48, 40, 0.08);
-                color: rgba(47, 38, 34, 0.8);
-                text-transform: uppercase;
-                letter-spacing: 0.13em;
-                font-size: 0.68rem;
-                font-weight: 700;
-            }
-
-            .primary-btn {
-                display: inline-flex;
-                justify-content: center;
-                align-items: center;
-                margin-top: 2rem;
-                padding: 0.95rem 1.8rem;
-                background: #3b2f2b;
-                border: 1px solid #3b2f2b;
-                border-radius: 999px;
-                color: #f8f5f2 !important;
-                text-transform: uppercase;
-                font-size: 0.76rem;
-                letter-spacing: 0.12em;
-                font-weight: 700;
-                text-decoration: none;
-            }
-
-            .summary-panel {
-                background: rgba(255, 255, 255, 0.34);
-                border: 1px solid rgba(47, 38, 34, 0.08);
-                border-radius: 1.3rem;
-                padding: 1.3rem;
-                box-shadow: 0 18px 35px rgba(57, 44, 37, 0.06);
-            }
-
-            .stat-box {
-                background: rgba(255, 255, 255, 0.38);
-                border: 1px solid rgba(47, 38, 34, 0.08);
-                border-radius: 1rem;
-                padding: 1rem 1.1rem;
-                min-height: 120px;
-            }
-
-            .kicker {
-                font-size: 0.72rem;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                color: rgba(47, 38, 34, 0.72);
-            }
-
-            .metric {
-                margin-top: 0.5rem;
-                font-size: 2.1rem;
-                font-weight: 700;
-                color: #2d2824;
-            }
-
-            .panel-title {
-                font-family: 'Cormorant Garamond', serif;
-                font-size: 2.5rem;
-                letter-spacing: -0.04em;
-                margin-bottom: 1rem;
-                color: #2d2824;
-            }
-
-            .stButton > button {
-                border-radius: 999px;
-                border: 1px solid #3b2f2b;
-                background: #3b2f2b;
-                color: #f8f5f2;
-                font-weight: 700;
-                padding: 0.7rem 1.2rem;
-            }
-
-            .stTextInput > div > div > input,
-            .stSelectbox > div > div > select {
-                border-radius: 0.8rem;
-                border: 1px solid rgba(47, 38, 34, 0.15);
-                background: rgba(255, 255, 255, 0.7);
-            }
-
-            .small-note {
-                font-size: 0.82rem;
-                color: rgba(47, 38, 34, 0.76);
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_hero() -> None:
-    left_col, right_col = st.columns([1.18, 1])
-
-    with left_col:
-        st.markdown(
-            """
-            <div class="hero-photo" style="background-image: url('https://images.unsplash.com/photo-1494526585095-c41746248156?auto=format&fit=crop&w=1200&q=80');"></div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with right_col:
-        st.markdown(
-            """
-            <div class="hero-copy">
-                <div>
-                    <div class='eyebrow'>Civic impact check</div>
-                    <h1 class='headline'>See who is affected<br>before the vote.</h1>
-                    <div class='muted-copy'>Poleazy surfaces the people, parcels, and pressure points around a proposed municipal change.</div>
-                    <a class='primary-btn' href='#impact-check'>Review the footprint</a>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-def render_topbar() -> None:
-    left_col, center_col, right_col = st.columns([1.25, 2, 1.2])
-    with left_col:
-        st.markdown("<p class='brand'>Poleazy</p>", unsafe_allow_html=True)
-    with center_col:
-        st.markdown(
-            """
-            <div class='nav'>
-                <span>Impact</span>
-                <span>Letters</span>
-                <span>Parcel map</span>
-                <span>Insights</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with right_col:
-        st.markdown(
-            """
-            <div class='nav'><span class='pill'>Live docket</span></div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-def _create_map(payload) -> folium.Map:
-    center_lat = float(payload.latitude)
-    center_lon = float(payload.longitude)
-    impact_map = folium.Map(location=[center_lat, center_lon], zoom_start=16, tiles="CartoDB Positron")
-
-    folium.Marker(
-        [center_lat, center_lon],
-        popup=f"Target: {payload.target_address}",
-        icon=folium.Icon(color="red", icon="map-pin", prefix="fa"),
-    ).add_to(impact_map)
-
-    folium.Circle(
-        location=[center_lat, center_lon],
-        radius=float(payload.buffer_meters),
-        color="#8AA89A",
-        fill=True,
-        fill_opacity=0.28,
-        weight=2,
-        popup=f"{payload.buffer_meters}m impact radius",
-    ).add_to(impact_map)
-
-    layer = payload.geojson_impact_layer or {"type": "FeatureCollection", "features": []}
-    if layer.get("features"):
-        parcels_fg = MarkerCluster(name="Affected parcels")
-        parcels_fg.add_child(
-            folium.GeoJson(
-                layer,
-                style_function=lambda feature: {
-                    "fillColor": "#D17C5E",
-                    "color": "#D17C5E",
-                    "weight": 1,
-                    "fillOpacity": 0.45,
-                },
-            )
-        )
-        impact_map.add_child(parcels_fg)
-
-    folium.LayerControl().add_to(impact_map)
-    return impact_map
-
-
-def render_results(payload, docket_id: str) -> None:
-    st.markdown('<div class="panel-title">Property impact overview</div>', unsafe_allow_html=True)
-
-    stats = st.columns(4)
-    with stats[0]:
-        st.markdown(
-            '<div class="stat-box"><div class="kicker">Address</div><div class="metric" style="font-size:1.1rem">%s</div></div>'
-            % payload.target_address,
-            unsafe_allow_html=True,
-        )
-    with stats[1]:
-        st.markdown(
-            '<div class="stat-box"><div class="kicker">Affected parcels</div><div class="metric">%s</div></div>'
-            % payload.affected_parcels_count,
-            unsafe_allow_html=True,
-        )
-    with stats[2]:
-        st.markdown(
-            '<div class="stat-box"><div class="kicker">Buffer</div><div class="metric">%s m</div></div>'
-            % int(payload.buffer_meters),
-            unsafe_allow_html=True,
-        )
-    with stats[3]:
-        st.markdown(
-            '<div class="stat-box"><div class="kicker">Coordinates</div><div class="metric" style="font-size:1.1rem">%s, %s</div></div>'
-            % (round(payload.latitude, 4), round(payload.longitude, 4)),
-            unsafe_allow_html=True,
-        )
-
-    map_col, details_col = st.columns([1.2, 0.8])
-    with map_col:
-        st.markdown('<div class="summary-panel">', unsafe_allow_html=True)
-        map_obj = _create_map(payload)
-        st_folium(map_obj, width=700, height=430)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with details_col:
-        st.markdown('<div class="summary-panel">', unsafe_allow_html=True)
-        st.markdown('<div class="panel-title" style="font-size: 2rem; margin-bottom: 0.5rem;">Plain-language summary</div>', unsafe_allow_html=True)
-
-        summary = (
-            f"This proposed action creates a {payload.buffer_meters}m impact radius around {payload.target_address}. "
-            f"Within that footprint, {payload.affected_parcels_count} nearby parcels are directly implicated by the proposal. "
-            "Residents in the surrounding block may face changes in traffic, transportation access, and neighborhood character while the item is considered."
-        )
-        st.write(summary)
-
-        action: CitizenAction = MOCK_PAYLOAD.citizen_action
-        if action and action.formal_letter:
-            text_bytes = _build_letter_text(action, payload.target_address, docket_id).encode("utf-8")
-            pdf_bytes = _build_pdf_letter(action, payload.target_address, docket_id)
-
-            col_text, col_pdf = st.columns(2)
-            with col_text:
-                st.download_button(
-                    label="Download text letter",
-                    data=text_bytes,
-                    file_name=f"poleazy_comment_letter_{docket_id}.txt",
-                    mime="text/plain",
+# 7. Pipeline Orchestration (Dev 1 -> Dev 2 -> Dev 3)
+if trigger_analysis or "pipeline_state" not in st.session_state:
+    with st.spinner("Executing pipeline: Dev 1 Ingestion & Dev 3 Spatial Buffer..."):
+        # DEV 1: Extract docket text & citations
+        if uploaded_pdf is not None:
+            temp_pdf_path = ROOT_DIR / "data" / "raw" / uploaded_pdf.name
+            temp_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(temp_pdf_path, "wb") as f:
+                f.write(uploaded_pdf.getbuffer())
+            docket_data = extract_docket_pdf(str(temp_pdf_path))
+        else:
+            # Fallback to Dev 1 baseline sample contract
+            docket_data = {
+                "docket_id": "ORD-2026-042",
+                "title": selected_preset,
+                "address_mention": "1400 Congress Ave, Austin, TX",
+                "citations": ["§ 25-2-492"],
+                "raw_text": (
+                    "An ordinance amending Austin City Code Title 25 Section 25-2-492 "
+                    "to reduce minimum interior side setbacks from 25 feet to 10 feet "
+                    "for high-density residential developments within urban core zones."
                 )
-            with col_pdf:
-                st.download_button(
-                    label="Download PDF letter",
-                    data=pdf_bytes,
-                    file_name=f"poleazy_comment_letter_{docket_id}.pdf",
-                    mime="application/pdf",
-                )
-        st.markdown('</div>', unsafe_allow_html=True)
+            }
+        
+        # DEV 1: Retrieve matching baseline statute from ChromaDB
+        citation = docket_data["citations"][0] if docket_data.get("citations") else "§ 25-2-492"
+        baseline_code = get_baseline_statute(citation)
+        
+        # DEV 3: Calculate spatial impact
+        parcels_path = str(ROOT_DIR / "data" / "parcels.geojson")
+        geo = compute_impact_zone(docket_data["address_mention"], parcels_path)
+        st.session_state.geo_payload = geo
+        st.session_state.docket_meta = docket_data
 
-
-def main() -> None:
-    st.set_page_config(page_title=PAGE_TITLE, layout="wide")
-    render_css()
-    render_topbar()
-
-    hero_container = st.container()
-    with hero_container:
-        render_hero()
-
-    st.markdown("<div style='height: 2rem;'></div>", unsafe_allow_html=True)
-    st.markdown('<div id="impact-check" class="panel-title">Council impact check</div>', unsafe_allow_html=True)
-
-    with st.form("impact_form"):
-        left_form, right_form = st.columns([1.1, 1.1])
-        with left_form:
-            docket = st.selectbox("Docket", ["ORD-2026-0891", "ORD-2026-0902", "ORD-2026-0914"], index=0)
-        with right_form:
-            address = st.text_input(
-                "Address",
-                value=MOCK_PAYLOAD.geospatial.target_address,
-                placeholder="e.g. 1400 Congress Ave, Austin, TX",
-            )
-
-        submitted = st.form_submit_button("Run impact check")
-
-    if submitted:
-        try:
-            parcel_path = get_default_parcels_path()
-            payload = compute_impact_zone(address, parcel_path)
-        except Exception as exc:  # pragma: no cover - user-facing validation path
-            st.warning(f"Impact lookup could not complete: {exc}")
-            payload = MOCK_PAYLOAD.geospatial
-        render_results(payload, docket)
+    # DEV 2: Execute Multi-Agent Graph (or Mock Fallback)
+    if use_live_llm:
+        with st.spinner("Dev 2 Agent Nodes active (legal_diff_node -> action_synthesis_node)..."):
+            runner = get_reasoning_runner()
+            st.session_state.pipeline_state = runner.invoke({
+                "docket_id": docket_data["docket_id"],
+                "title": docket_data["title"],
+                "raw_text": docket_data["raw_text"],
+                "baseline": baseline_code
+            })
     else:
-        st.info("Use the form above to check a candidate address against the civic impact footprint.")
-        render_results(MOCK_PAYLOAD.geospatial, MOCK_PAYLOAD.docket_id)
+        st.session_state.pipeline_state = {
+            "docket_id": docket_data["docket_id"],
+            "legal_diff": MOCK_PAYLOAD.legal_diff,
+            "citizen_action": MOCK_PAYLOAD.citizen_action
+        }
 
+# 8. Render Dynamic KPI Metrics
+state = st.session_state.pipeline_state
+geo = st.session_state.get("geo_payload", MOCK_PAYLOAD.geospatial)
+docket_meta = st.session_state.get("docket_meta", {})
 
-if __name__ == "__main__":
-    main()
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Docket ID", docket_meta.get("docket_id", state.get("docket_id", "ORD-2026-042")))
+col2.metric("Target Site", getattr(geo, "target_address", "1400 Congress Ave, Austin, TX"))
+col3.metric("Impact Radius", f"{getattr(geo, 'buffer_meters', 300)} m")
+col4.metric("Affected Parcels", str(getattr(geo, "affected_parcels_count", 34)))
+
+st.divider()
+
+# 9. Geospatial Footprint & Parcels
+col_map, col_info = st.columns([3, 2])
+with col_map:
+    st.subheader("📍 Geospatial Impact Zone")
+    impact_map = render_impact_map(
+        lat=getattr(geo, "latitude", 30.2766),
+        lon=getattr(geo, "longitude", -97.7413),
+        radius_m=getattr(geo, "buffer_meters", 300.0)
+    )
+    st_folium(impact_map, width="100%", height=380)
+
+with col_info:
+    st.subheader("📌 Parcel Context")
+    st.markdown(
+        f"""
+        Target: **{getattr(geo, 'target_address', '1400 Congress Ave')}**
+        
+        * **{getattr(geo, 'affected_parcels_count', 34)} tax parcels** identified in buffer zone.
+        * Buffer radius: **{getattr(geo, 'buffer_meters', 300)} meters**.
+        * Notifications staged for public testimony.
+        """
+    )
+    st.success("Dev 1 Data & Dev 2 Reasoning Graph synchronized.")
+
+st.divider()
+
+# 10. Dev 2 Agent 1 Output: Plain Language & Statutory Diff
+diff = state.get("legal_diff")
+st.subheader("📋 Statutory Impact & Analysis")
+
+plain_summary = getattr(diff, "plain_summary", "") if diff else ""
+if plain_summary:
+    st.info(f"**Plain-Language Neighborhood Impact:** {plain_summary}")
+
+col_base, col_prop = st.columns(2)
+with col_base:
+    sec = getattr(diff, "section_code", "Baseline Law") if diff else "Baseline Law"
+    st.markdown(f"##### 🏛️ Baseline Statute ({sec})")
+    base_text = getattr(diff, "baseline_rule", "No baseline cited.") if diff else "No baseline cited."
+    st.warning(base_text)
+
+with col_prop:
+    st.markdown("##### ⚡ Proposed Amendment")
+    prop_text = getattr(diff, "proposed_rule", "No amendment details.") if diff else "No amendment details."
+    st.success(prop_text)
+
+st.divider()
+
+# 11. Dev 2 Agent 2 Output: Dual Perspectives, Speech & SMS
+action = state.get("citizen_action")
+st.subheader("⚖️ Civic Perspectives & Citizen Action")
+
+tab_perspectives, tab_sms = st.tabs([
+    "🗣️ Dual Perspectives & 60-Sec Podium Speech",
+    "📱 SMS Community Broadcast"
+])
+
+with tab_perspectives:
+    speech_text = getattr(action, "formal_letter", "") if action else ""
+    if speech_text:
+        st.markdown(speech_text)
+    else:
+        st.info("No advocacy text generated.")
+
+with tab_sms:
+    sms_text = getattr(action, "sms_alert", "") if action else ""
+    st.markdown("**160-Character Neutral Resident Notification:**")
+    st.code(sms_text or "No SMS generated.", language="text")
+    st.caption(f"Character count: {len(sms_text)} / 160")
