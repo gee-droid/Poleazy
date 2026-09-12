@@ -1,54 +1,42 @@
-# Developer 2: Agent Systems, Legal Diff & Verification
+# Developer 2: Multi-Agent Reasoning Engine
 
-**Folder Scope:** `dev2_agents/`  
-**Dependencies:** `langgraph`, `langchain-groq`, `pydantic`, `python-dotenv`
-
----
-
-## 1. Core Objectives
-1. Implement a stateful **LangGraph** multi-node architecture for legal reasoning.
-2. Ingest raw parsed docket text and baseline statutes to isolate statutory deltas (setbacks, height limits, zoning changes).
-3. Synthesize plain-language citizen impact summaries (Grade 8 reading level) and official formal letters to council members.
-4. Implement a fact-checking verification guardrail node to prevent model hallucinations.
+This module implements the core policy-analysis and advocacy engine using **LangGraph** and **Groq** (`groq/compound`). It processes raw ordinance text and baseline municipal statutes to generate structured legal diffs and citizen advocacy tools.
 
 ---
 
-## 2. File Responsibilities
+## Architecture Overview
 
-### `dev2_agents/prompts.py`
-* Stores structured system prompts for statutory diffing, citizen summaries, and citation evaluation.
+The pipeline runs as a two-node sequential state graph:
 
-### `dev2_agents/graph.py`
-* Defines `CivicAgentState` and compiles the LangGraph workflow:
-  ```python
-  from langgraph.graph import StateGraph, END
-  from langchain_groq import ChatGroq
-  from core.schema import LegalDiff, CitizenAction
+1. **`legal_diff_node`**:
+   - Ingests raw ordinance text and baseline legal statutes.
+   - Extracts specific statute sections and side-by-side rule comparisons.
+   - Simplifies complex statutory jargon into an 8th-grade reading level impact summary.
 
-  llm = ChatGroq(model="llama-3.3-70b-versatile")
-
-  def legal_diff_node(state):
-      # Extracts statutory deltas comparing docket text against baseline statutes
-      ...
-
-  def action_synthesis_node(state):
-      # Generates Grade-8 citizen digest & drafted council letters
-      ...
-
-  def audit_guardrail_node(state):
-      # Evaluates claims strictly against original text chunks
-      ...
-
-  def route_audit(state):
-      return END if state["verified"] else "legal_diff_node"
-  ```
+2. **`action_synthesis_node`**:
+   - Takes the plain summary and synthesizes balanced civic advocacy materials.
+   - Generates a concise SMS alert ($\le$ 160 characters).
+   - Generates a dual-perspective brief (Pro-Growth vs. Community Scrutiny) and a 60-second podium script for city council testimony.
 
 ---
 
-## 3. Integration Output Contract
-Dev 2 exposes a single callable execution function:
+## Quickstart for Developer 3 (Streamlit Integration)
+
+### 1. Import and Run
+
 ```python
-def run_reasoning_agents(docket_dict: dict, baseline_text: str) -> tuple[LegalDiff, CitizenAction]:
-    # Returns validated Pydantic instances ready for final schema packaging
-    ...
-```
+from dev2_agents import build_reasoning_graph
+
+# 1. Compile the graph runner
+reasoning_graph = build_reasoning_graph()
+
+# 2. Provide the input payload (matches Dev 1 output)
+state_input = {
+    "docket_id": "ORD-2026-042",
+    "title": "Ordinance Amending Austin City Code Title 25 (Section 25-2-492)",
+    "raw_text": "Body text of the proposed ordinance...",
+    "baseline": "Baseline statutory text from municipal code..."
+}
+
+# 3. Execute
+final_state = reasoning_graph.invoke(state_input)
