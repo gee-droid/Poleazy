@@ -1,3 +1,5 @@
+import re
+
 from pathlib import Path
 from typing import List, Dict
 
@@ -137,6 +139,37 @@ def chunk_text(
 
 # INDEX BASELINE CODE :
 
+def extract_citations(text: str) -> List[str]:
+        """
+        Extract common Austin municipal code citations
+        from baseline text.
+        """
+
+        citations = set()
+
+        # Matches:
+        # § 25-2-191
+        # Section 25-2-191
+        section_pattern = r"(?:§|Section)\s*(\d+(?:-\d+)+)"
+
+        for match in re.findall(section_pattern, text, re.IGNORECASE):
+            citations.add(f"§ {match}")
+
+        # Matches:
+        # Ordinance No. 20100624-112
+        ordinance_pattern = r"Ordinance\s+No\.\s*([0-9-]+)"
+
+        for match in re.findall(
+            ordinance_pattern,
+            text,
+            re.IGNORECASE
+        ):
+            citations.add(
+                f"Ordinance No. {match}"
+            )
+
+        return sorted(citations)
+
 def index_baseline_code() -> int:
     """
     Load baseline documents, chunk them, embed them,
@@ -165,6 +198,10 @@ def index_baseline_code() -> int:
             document["text"]
         )
 
+        citations = extract_citations(
+            document["text"]
+        )
+
         for index, chunk in enumerate(chunks):
 
             all_chunks.append(chunk)
@@ -176,7 +213,8 @@ def index_baseline_code() -> int:
             all_metadatas.append(
                 {
                     "source": document["source"],
-                    "chunk_index": index
+                    "chunk_index": index,
+                    "citations": "|".join(citations)
                 }
             )
 
@@ -208,8 +246,10 @@ def get_baseline_statute(
     n_results: int = 3
 ) -> str:
     """
-    Retrieve baseline-code passages relevant to a
-    citation or legal query.
+    Retrieve baseline-code passages relevant to a citation.
+
+    First attempts an exact citation lookup.
+    Falls back to semantic search if no exact match exists.
     """
 
     collection = get_collection()
@@ -219,6 +259,53 @@ def get_baseline_statute(
             "ChromaDB is empty. "
             "Run index_baseline_code() first."
         )
+
+    # --------------------------------------------------------
+    # Normalize citation
+    # --------------------------------------------------------
+
+    citation = citation_code.strip()
+
+    # Convert:
+    # Section 25-2-191
+    # into:
+    # § 25-2-191
+
+    section_match = re.search(
+        r"(?:§|Section)\s*(\d+(?:-\d+)+)",
+        citation,
+        re.IGNORECASE
+    )
+
+    if section_match:
+        citation = f"§ {section_match.group(1)}"
+
+    # --------------------------------------------------------
+    # Exact citation search
+    # --------------------------------------------------------
+
+    exact_results = collection.get(
+        where={
+            "citations": {
+                "$contains": citation
+            }
+        }
+    )
+
+    exact_documents = exact_results.get(
+        "documents",
+        []
+    )
+
+    if exact_documents:
+
+        return "\n\n---\n\n".join(
+            exact_documents[:n_results]
+        )
+
+    # --------------------------------------------------------
+    # Semantic fallback
+    # --------------------------------------------------------
 
     model = get_embedding_model()
 
